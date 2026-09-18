@@ -3,6 +3,7 @@ import {
   planRanges,
   DEFAULT_MAX_SEGMENTS,
   DEFAULT_TRANSFER_SIZE_RATIO,
+  MAX_HEADER_VALUE_LENGTH,
 } from './planner.js';
 
 const MEDIA_TYPE_RE =
@@ -15,10 +16,11 @@ const planBodySchema = {
   properties: {
     size: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
     contentType: { type: 'string', minLength: 1, maxLength: 255 },
+    // Current resource validators, used together with the If-Range header.
+    etag: { type: 'string', minLength: 1, maxLength: MAX_HEADER_VALUE_LENGTH },
+    lastModified: { type: 'string', minLength: 1, maxLength: MAX_HEADER_VALUE_LENGTH },
   },
 };
-
-const MAX_HEADER_LENGTH = 4096;
 
 export function buildApp(config = {}) {
   const app = Fastify({
@@ -44,8 +46,8 @@ export function buildApp(config = {}) {
   // Primary endpoint: POST /plan with a JSON body, Range carried as a header
   // exactly as it would arrive on a real origin request.
   app.post('/plan', { schema: { body: planBodySchema } }, async (request, reply) => {
-    const rangeError = checkRangeHeader(request);
-    if (rangeError) return reply.status(400).send(rangeError);
+    const headerError = checkConditionalHeaders(request);
+    if (headerError) return reply.status(400).send(headerError);
 
     if (request.body.contentType !== undefined && !MEDIA_TYPE_RE.test(request.body.contentType)) {
       return reply.status(400).send({
@@ -59,7 +61,10 @@ export function buildApp(config = {}) {
     const result = planRanges({
       size: request.body.size,
       contentType: request.body.contentType,
+      etag: request.body.etag,
+      lastModified: request.body.lastModified,
       rangeHeader: request.headers.range,
+      ifRangeHeader: request.headers['if-range'],
       maxSegments,
       transferSizeRatio,
     });
@@ -70,7 +75,7 @@ export function buildApp(config = {}) {
   // Convenience endpoint so the API is probeable with a bare curl:
   //   curl 'http://localhost:3000/plan?size=1000' -H 'Range: bytes=0-99'
   app.get('/plan', async (request, reply) => {
-    const { size: sizeRaw, contentType } = request.query;
+    const { size: sizeRaw, contentType, etag, lastModified } = request.query;
 
     const size = Number(sizeRaw);
     if (sizeRaw === undefined || !Number.isSafeInteger(size) || size < 0 || String(size) !== String(sizeRaw).trim()) {
@@ -81,7 +86,7 @@ export function buildApp(config = {}) {
         message: 'query parameter size is required and must be a non-negative integer',
       });
     }
-    if (contentType !== undefined && !MEDIA_TYPE_RE.test(contentType)) {
+    if (contentType !== undefined && (!singleString(contentType) || !MEDIA_TYPE_RE.test(contentType))) {
       return reply.status(400).send({
         statusCode: 400,
         code: 'INVALID_CONTENT_TYPE',
@@ -89,14 +94,28 @@ export function buildApp(config = {}) {
         message: 'contentType must be a valid media type, e.g. application/pdf',
       });
     }
+    // Reject duplicated query parameters (e.g. ?etag=a&etag=b) before they
+    // reach the planner as arrays.
+    if ((etag !== undefined && !singleString(etag)) ||
+        (lastModified !== undefined && !singleString(lastModified))) {
+      return reply.status(400).send({
+        statusCode: 400,
+        code: 'INVALID_QUERY_PARAMETER',
+        error: 'Bad Request',
+        message: 'etag and lastModified must each appear at most once',
+      });
+    }
 
-    const rangeError = checkRangeHeader(request);
-    if (rangeError) return reply.status(400).send(rangeError);
+    const headerError = checkConditionalHeaders(request);
+    if (headerError) return reply.status(400).send(headerError);
 
     const result = planRanges({
       size,
       contentType,
+      etag,
+      lastModified,
       rangeHeader: request.headers.range,
+      ifRangeHeader: request.headers['if-range'],
       maxSegments,
       transferSizeRatio,
     });
@@ -107,38 +126,61 @@ export function buildApp(config = {}) {
   return app;
 }
 
-function checkRangeHeader(request) {
-  // Reject duplicate Range headers explicitly; Node would otherwise silently
-  // join them with a comma and produce a confusing parse error.
-  let occurrences = 0;
+function singleString(value) {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function checkConditionalHeaders(request) {
+  const counts = { range: 0, 'if-range': 0 };
   for (let i = 0; i < request.raw.rawHeaders.length; i += 2) {
-    if (request.raw.rawHeaders[i].toLowerCase() === 'range') occurrences += 1;
+    const name = request.raw.rawHeaders[i].toLowerCase();
+    if (name === 'range' || name === 'if-range') {
+      counts[name] += 1;
+      const value = request.raw.rawHeaders[i + 1];
+      // Header injection defense: CR/LF must never appear inside a value.
+      if (typeof value === 'string' && /[\r\n]/.test(value)) {
+        return badRequest(
+          name === 'range' ? 'MALFORMED_RANGE' : 'MALFORMED_IF_RANGE',
+          `${name} header value must not contain CR or LF characters`,
+        );
+      }
+    }
   }
-  if (occurrences > 1) {
-    return {
-      statusCode: 400,
-      code: 'DUPLICATE_RANGE_HEADER',
-      error: 'Bad Request',
-      message: 'exactly one Range header is allowed',
-    };
+
+  if (counts.range > 1) {
+    return badRequest('DUPLICATE_RANGE_HEADER', 'exactly one Range header is allowed');
+  }
+  if (counts['if-range'] > 1) {
+    return badRequest('DUPLICATE_IF_RANGE_HEADER', 'exactly one If-Range header is allowed');
   }
 
   const rangeHeader = request.headers.range;
   if (rangeHeader === undefined) {
-    return {
-      statusCode: 400,
-      code: 'MISSING_RANGE',
-      error: 'Bad Request',
-      message: 'a Range request header is required',
-    };
+    return badRequest('MISSING_RANGE', 'a Range request header is required');
   }
-  if (rangeHeader.length > MAX_HEADER_LENGTH) {
-    return {
-      statusCode: 400,
-      code: 'MALFORMED_RANGE',
-      error: 'Bad Request',
-      message: `Range header exceeds the ${MAX_HEADER_LENGTH}-byte limit`,
-    };
+  if (rangeHeader.length > MAX_HEADER_VALUE_LENGTH) {
+    return badRequest(
+      'MALFORMED_RANGE',
+      `Range header exceeds the ${MAX_HEADER_VALUE_LENGTH}-byte limit`,
+    );
   }
+
+  const ifRangeHeader = request.headers['if-range'];
+  if (ifRangeHeader !== undefined && ifRangeHeader.length > MAX_HEADER_VALUE_LENGTH) {
+    return badRequest(
+      'MALFORMED_IF_RANGE',
+      `If-Range header exceeds the ${MAX_HEADER_VALUE_LENGTH}-byte limit`,
+    );
+  }
+
   return null;
+}
+
+function badRequest(code, message) {
+  return {
+    statusCode: 400,
+    code,
+    error: 'Bad Request',
+    message,
+  };
 }
