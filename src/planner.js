@@ -8,6 +8,7 @@
 
 import { createHash } from 'node:crypto';
 import createRangeParser from 'range-parser';
+import { evaluateIfRange } from './conditional.js';
 
 const rangeParser = createRangeParser.default ?? createRangeParser;
 
@@ -36,6 +37,9 @@ export function planRanges(options) {
     contentType = DEFAULT_CONTENT_TYPE,
     maxSegments = DEFAULT_MAX_SEGMENTS,
     transferSizeRatio = DEFAULT_TRANSFER_SIZE_RATIO,
+    etag,
+    lastModified,
+    ifRange,
   } = options;
 
   if (!Number.isSafeInteger(size) || size < 0) {
@@ -44,11 +48,32 @@ export function planRanges(options) {
   if (typeof rangeHeader !== 'string') {
     return fail(400, 'MISSING_RANGE', 'a Range request header is required');
   }
-  if (rangeHeader.length === 0) {
-    return fail(400, 'MALFORMED_RANGE', "Range header must look like 'bytes=0-99'");
-  }
   if (typeof contentType !== 'string' || /[\r\n]/.test(contentType) || contentType.length === 0) {
     return fail(400, 'INVALID_CONTENT_TYPE', 'contentType must be a single header-safe string');
+  }
+  if (etag !== undefined && (typeof etag !== 'string' || /[\r\n]/.test(etag) || etag.length === 0)) {
+    return fail(400, 'INVALID_ETAG', 'etag must be a single header-safe entity-tag string');
+  }
+  if (
+    lastModified !== undefined &&
+    (typeof lastModified !== 'string' || /[\r\n]/.test(lastModified) || lastModified.length === 0)
+  ) {
+    return fail(400, 'INVALID_LAST_MODIFIED', 'lastModified must be a single header-safe HTTP-date string');
+  }
+  if (ifRange !== undefined && (typeof ifRange !== 'string' || /[\r\n]/.test(ifRange))) {
+    return fail(400, 'INVALID_IF_RANGE', 'If-Range must be one entity-tag or one HTTP-date');
+  }
+
+  // RFC 9110 §13.1.3: a failed If-Range precondition downgrades the response
+  // to the full representation. The Range header is not even parsed, so a
+  // malformed Range paired with a failing If-Range still yields 200.
+  const condition = ifRange !== undefined ? evaluateIfRange({ ifRange, etag, lastModified }) : null;
+  if (condition && !condition.satisfied) {
+    return buildFullRepresentation({ size, contentType, etag, lastModified, condition });
+  }
+
+  if (rangeHeader.length === 0) {
+    return fail(400, 'MALFORMED_RANGE', "Range header must look like 'bytes=0-99'");
   }
 
   const normalizedHeaderResult = normalizeRangeHeader(rangeHeader, size);
@@ -61,20 +86,90 @@ export function planRanges(options) {
     return fail(400, 'MALFORMED_RANGE', 'Range header is not a syntactically valid byte-ranges value');
   }
   if (parsed === -1 || parsed.length === 0) {
+    const responseHeaders = {
+      'Accept-Ranges': 'bytes',
+      'Content-Range': `bytes */${size}`,
+    };
+    if (etag !== undefined) responseHeaders.ETag = etag;
+    if (lastModified !== undefined) responseHeaders['Last-Modified'] = lastModified;
     return {
       statusCode: 416,
+      decision: 'partial',
       code: 'RANGE_NOT_SATISFIABLE',
       error: 'Range Not Satisfiable',
       message: `none of the requested ranges intersect the ${size}-byte resource`,
-      resource: { size, contentType },
-      responseHeaders: {
-        'Accept-Ranges': 'bytes',
-        'Content-Range': `bytes */${size}`,
-      },
+      resource: buildResource({ size, contentType, etag, lastModified }),
+      responseHeaders,
+      ...(condition ? {
+        condition: {
+          header: 'If-Range',
+          validatorKind: condition.kind,
+          outcome: 'passed',
+          reason: condition.reason,
+        },
+      } : {}),
     };
   }
 
-  return buildPlan({ ranges: parsed, size, contentType, maxSegments, transferSizeRatio });
+  return buildPlan({
+    ranges: parsed,
+    size,
+    contentType,
+    maxSegments,
+    transferSizeRatio,
+    etag,
+    lastModified,
+    condition,
+  });
+}
+
+/**
+ * Build the 200 plan for a full representation: If-Range failed (or the
+ * request would otherwise be downgraded), so Range is ignored and the whole
+ * resource would be sent with Content-Length: size.
+ */
+function buildFullRepresentation({ size, contentType, etag, lastModified, condition }) {
+  const responseHeaders = {
+    'Accept-Ranges': 'bytes',
+    'Content-Type': contentType,
+    'Content-Length': String(size),
+  };
+  if (etag !== undefined) responseHeaders.ETag = etag;
+  if (lastModified !== undefined) responseHeaders['Last-Modified'] = lastModified;
+
+  return {
+    statusCode: 200,
+    decision: 'full',
+    resource: buildResource({ size, contentType, etag, lastModified }),
+    segmentsCount: null,
+    segments: null,
+    bytes: {
+      selected: size,
+      framing: 0,
+      total: size,
+      resource: size,
+      ratio: 1,
+    },
+    multipart: null,
+    responseHeaders,
+    condition: {
+      header: 'If-Range',
+      validatorKind: condition.kind,
+      outcome: 'failed',
+      reason: condition.reason,
+    },
+  };
+}
+
+/**
+ * Resource descriptor shared by every plan; ETag/Last-Modified are only
+ * echoed when the client supplied them.
+ */
+function buildResource({ size, contentType, etag, lastModified }) {
+  const resource = { size, contentType };
+  if (etag !== undefined) resource.etag = etag;
+  if (lastModified !== undefined) resource.lastModified = lastModified;
+  return resource;
 }
 
 /**
@@ -149,7 +244,7 @@ function normalizeSpec(rawSpec, size) {
   return `${Number(start)}-${end >= sizeBig ? size - 1 : Number(end)}`;
 }
 
-function buildPlan({ ranges, size, contentType, maxSegments, transferSizeRatio }) {
+function buildPlan({ ranges, size, contentType, maxSegments, transferSizeRatio, etag, lastModified, condition }) {
   const boundary = makeBoundary({ size, contentType, ranges });
 
   const segments = ranges.map((range, index) => {
@@ -193,10 +288,11 @@ function buildPlan({ ranges, size, contentType, maxSegments, transferSizeRatio }
   if (segments.length > maxSegments) {
     return {
       statusCode: 422,
+      decision: 'partial',
       code: 'TOO_MANY_SEGMENTS',
       error: 'Unprocessable Entity',
       message: `range plan has ${segments.length} segments; at most ${maxSegments} are allowed`,
-      resource: { size, contentType },
+      resource: buildResource({ size, contentType, etag, lastModified }),
       segmentsCount: segments.length,
       maxSegments,
       selectedBytes,
@@ -208,12 +304,13 @@ function buildPlan({ ranges, size, contentType, maxSegments, transferSizeRatio }
   if (size > 0 && totalBytes > size * transferSizeRatio) {
     return {
       statusCode: 422,
+      decision: 'partial',
       code: 'TRANSFER_LIMIT_EXCEEDED',
       error: 'Unprocessable Entity',
       message:
         `planned transfer of ${totalBytes} bytes exceeds ` +
         `${transferSizeRatio}x the ${size}-byte resource`,
-      resource: { size, contentType },
+      resource: buildResource({ size, contentType, etag, lastModified }),
       segmentsCount: segments.length,
       selectedBytes,
       framingBytes,
@@ -224,7 +321,8 @@ function buildPlan({ ranges, size, contentType, maxSegments, transferSizeRatio }
 
   const base = {
     statusCode: 206,
-    resource: { size, contentType },
+    decision: 'partial',
+    resource: buildResource({ size, contentType, etag, lastModified }),
     segmentsCount: segments.length,
     segments,
     bytes: {
@@ -236,6 +334,21 @@ function buildPlan({ ranges, size, contentType, maxSegments, transferSizeRatio }
     },
   };
 
+  const validatorHeaders = {};
+  if (etag !== undefined) validatorHeaders.ETag = etag;
+  if (lastModified !== undefined) validatorHeaders['Last-Modified'] = lastModified;
+
+  // Why the range was honoured; present only when the client asked via If-Range.
+  const conditionBlock =
+    condition === null
+      ? null
+      : {
+          header: 'If-Range',
+          validatorKind: condition.kind,
+          outcome: 'passed',
+          reason: condition.reason,
+        };
+
   if (!isMultipart) {
     const only = segments[0];
     return {
@@ -243,10 +356,12 @@ function buildPlan({ ranges, size, contentType, maxSegments, transferSizeRatio }
       multipart: null,
       responseHeaders: {
         'Accept-Ranges': 'bytes',
+        ...validatorHeaders,
         'Content-Type': contentType,
         'Content-Range': `bytes ${only.start}-${only.end}/${size}`,
         'Content-Length': String(only.bytes),
       },
+      ...(conditionBlock ? { condition: conditionBlock } : {}),
     };
   }
 
@@ -261,9 +376,11 @@ function buildPlan({ ranges, size, contentType, maxSegments, transferSizeRatio }
     },
     responseHeaders: {
       'Accept-Ranges': 'bytes',
+      ...validatorHeaders,
       'Content-Type': multipartContentType,
       'Content-Length': String(totalBytes),
     },
+    ...(conditionBlock ? { condition: conditionBlock } : {}),
   };
 }
 

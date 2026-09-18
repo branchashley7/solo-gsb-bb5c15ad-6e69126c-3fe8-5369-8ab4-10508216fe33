@@ -4,6 +4,7 @@ import {
   DEFAULT_MAX_SEGMENTS,
   DEFAULT_TRANSFER_SIZE_RATIO,
 } from './planner.js';
+import { ENTITY_TAG_RE, parseHttpDate } from './conditional.js';
 
 const MEDIA_TYPE_RE =
   /^[A-Za-z0-9][A-Za-z0-9!#$%&'*+.^_`|~-]*\/[A-Za-z0-9][A-Za-z0-9!#$%&'*+.^_`|~-]*(?:\s*;\s*[A-Za-z0-9!#$%&'*+.^_`|~-]+=(?:[A-Za-z0-9!#$%&'*+.^_`|~-]+|"(?:[^"\\\r\n]|\\.)*"))*$/;
@@ -15,10 +16,13 @@ const planBodySchema = {
   properties: {
     size: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
     contentType: { type: 'string', minLength: 1, maxLength: 255 },
+    etag: { type: 'string', minLength: 1, maxLength: 1024 },
+    lastModified: { type: 'string', minLength: 1, maxLength: 255 },
   },
 };
 
 const MAX_HEADER_LENGTH = 4096;
+const MAX_METADATA_LENGTH = { etag: 1024, lastModified: 255 };
 
 export function buildApp(config = {}) {
   const app = Fastify({
@@ -47,14 +51,18 @@ export function buildApp(config = {}) {
     const rangeError = checkRangeHeader(request);
     if (rangeError) return reply.status(400).send(rangeError);
 
+    const ifRangeError = checkIfRangeHeader(request);
+    if (ifRangeError) return reply.status(400).send(ifRangeError);
+
     if (request.body.contentType !== undefined && !MEDIA_TYPE_RE.test(request.body.contentType)) {
-      return reply.status(400).send({
-        statusCode: 400,
-        code: 'INVALID_CONTENT_TYPE',
-        error: 'Bad Request',
-        message: 'contentType must be a valid media type, e.g. application/pdf',
-      });
+      return reply.status(400).send(invalidContentType());
     }
+
+    const metadataError = checkMetadata({
+      etag: request.body.etag,
+      lastModified: request.body.lastModified,
+    });
+    if (metadataError) return reply.status(400).send(metadataError);
 
     const result = planRanges({
       size: request.body.size,
@@ -62,6 +70,9 @@ export function buildApp(config = {}) {
       rangeHeader: request.headers.range,
       maxSegments,
       transferSizeRatio,
+      etag: request.body.etag,
+      lastModified: request.body.lastModified,
+      ifRange: request.headers['if-range'],
     });
 
     return reply.status(result.statusCode).send(result);
@@ -70,7 +81,7 @@ export function buildApp(config = {}) {
   // Convenience endpoint so the API is probeable with a bare curl:
   //   curl 'http://localhost:3000/plan?size=1000' -H 'Range: bytes=0-99'
   app.get('/plan', async (request, reply) => {
-    const { size: sizeRaw, contentType } = request.query;
+    const { size: sizeRaw, contentType, etag, lastModified } = request.query;
 
     const size = Number(sizeRaw);
     if (sizeRaw === undefined || !Number.isSafeInteger(size) || size < 0 || String(size) !== String(sizeRaw).trim()) {
@@ -82,16 +93,33 @@ export function buildApp(config = {}) {
       });
     }
     if (contentType !== undefined && !MEDIA_TYPE_RE.test(contentType)) {
-      return reply.status(400).send({
-        statusCode: 400,
-        code: 'INVALID_CONTENT_TYPE',
-        error: 'Bad Request',
-        message: 'contentType must be a valid media type, e.g. application/pdf',
-      });
+      return reply.status(400).send(invalidContentType());
     }
+
+    // Repeated query params arrive as arrays.
+    const duplicateCodes = {
+      etag: 'DUPLICATE_ETAG_PARAMETER',
+      lastModified: 'DUPLICATE_LAST_MODIFIED_PARAMETER',
+    };
+    for (const [name, value] of [['etag', etag], ['lastModified', lastModified]]) {
+      if (Array.isArray(value)) {
+        return reply.status(400).send({
+          statusCode: 400,
+          code: duplicateCodes[name],
+          error: 'Bad Request',
+          message: `exactly one ${name} query parameter is allowed`,
+        });
+      }
+    }
+
+    const metadataError = checkMetadata({ etag, lastModified });
+    if (metadataError) return reply.status(400).send(metadataError);
 
     const rangeError = checkRangeHeader(request);
     if (rangeError) return reply.status(400).send(rangeError);
+
+    const ifRangeError = checkIfRangeHeader(request);
+    if (ifRangeError) return reply.status(400).send(ifRangeError);
 
     const result = planRanges({
       size,
@@ -99,12 +127,57 @@ export function buildApp(config = {}) {
       rangeHeader: request.headers.range,
       maxSegments,
       transferSizeRatio,
+      etag,
+      lastModified,
+      ifRange: request.headers['if-range'],
     });
 
     return reply.status(result.statusCode).send(result);
   });
 
   return app;
+}
+
+function invalidContentType() {
+  return {
+    statusCode: 400,
+    code: 'INVALID_CONTENT_TYPE',
+    error: 'Bad Request',
+    message: 'contentType must be a valid media type, e.g. application/pdf',
+  };
+}
+
+/**
+ * Validate current-resource metadata that an If-Range header is evaluated
+ * against. Fields are optional, but a present field must be a well-formed
+ * entity-tag / HTTP-date and contain no CR/LF.
+ */
+function checkMetadata({ etag, lastModified }) {
+  if (etag !== undefined) {
+    if (etag.length > MAX_METADATA_LENGTH.etag || /[\r\n]/.test(etag) || !ENTITY_TAG_RE.test(etag)) {
+      return {
+        statusCode: 400,
+        code: 'INVALID_ETAG',
+        error: 'Bad Request',
+        message: "etag must be a valid entity-tag, e.g. '\"abc123\"' or 'W/\"abc123\"'",
+      };
+    }
+  }
+  if (lastModified !== undefined) {
+    if (
+      lastModified.length > MAX_METADATA_LENGTH.lastModified ||
+      /[\r\n]/.test(lastModified) ||
+      parseHttpDate(lastModified) === null
+    ) {
+      return {
+        statusCode: 400,
+        code: 'INVALID_LAST_MODIFIED',
+        error: 'Bad Request',
+        message: 'lastModified must be a valid IMF-fixdate, e.g. Tue, 15 Nov 1994 08:12:31 GMT',
+      };
+    }
+  }
+  return null;
 }
 
 function checkRangeHeader(request) {
@@ -138,6 +211,46 @@ function checkRangeHeader(request) {
       code: 'MALFORMED_RANGE',
       error: 'Bad Request',
       message: `Range header exceeds the ${MAX_HEADER_LENGTH}-byte limit`,
+    };
+  }
+  return null;
+}
+
+function checkIfRangeHeader(request) {
+  // Reject duplicate If-Range headers; a conditional field must carry exactly
+  // one validator (one entity-tag or one HTTP-date, never a comma-joined list).
+  let occurrences = 0;
+  for (let i = 0; i < request.raw.rawHeaders.length; i += 2) {
+    if (request.raw.rawHeaders[i].toLowerCase() === 'if-range') occurrences += 1;
+  }
+  if (occurrences > 1) {
+    return {
+      statusCode: 400,
+      code: 'DUPLICATE_IF_RANGE_HEADER',
+      error: 'Bad Request',
+      message: 'exactly one If-Range header is allowed',
+    };
+  }
+
+  const ifRange = request.headers['if-range'];
+  if (ifRange === undefined) return null;
+
+  // CR/LF must never reach a value even though the HTTP parser forbids them
+  // in folded header content; reject unconditionally to rule out injection.
+  if (/[\r\n]/.test(ifRange)) {
+    return {
+      statusCode: 400,
+      code: 'INVALID_IF_RANGE',
+      error: 'Bad Request',
+      message: 'If-Range must not contain CR or LF characters',
+    };
+  }
+  if (ifRange.length > MAX_HEADER_LENGTH) {
+    return {
+      statusCode: 400,
+      code: 'INVALID_IF_RANGE',
+      error: 'Bad Request',
+      message: `If-Range header exceeds the ${MAX_HEADER_LENGTH}-byte limit`,
     };
   }
   return null;
